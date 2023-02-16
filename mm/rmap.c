@@ -532,6 +532,12 @@ struct anon_vma *page_lock_anon_vma_read(struct page *page)
 		}
 		goto out;
 	}
+#ifdef CONFIG_KSHRINK_LRUVECD
+	if (reclaim_page_trylock(page, NULL, NULL)) {
+		anon_vma = NULL;
+		goto out;
+	}
+#endif /* CONFIG_KSHRINK_LRUVECD */
 
 	/* trylock failed, we got to sleep */
 	if (!atomic_inc_not_zero(&anon_vma->refcount)) {
@@ -1017,7 +1023,7 @@ void page_move_anon_rmap(struct page *page, struct vm_area_struct *vma)
  * __page_set_anon_rmap - set up new anonymous rmap
  * @page:	Page or Hugepage to add to rmap
  * @vma:	VM area to add page to.
- * @address:	User virtual address of the mapping	
+ * @address:	User virtual address of the mapping
  * @exclusive:	the page is exclusively owned by the current process
  */
 static void __page_set_anon_rmap(struct page *page,
@@ -1106,9 +1112,12 @@ void do_page_add_anon_rmap(struct page *page,
 		mapcount = compound_mapcount_ptr(page);
 		first = atomic_inc_and_test(mapcount);
 	} else {
+#ifdef CONFIG_MAPPED_PROTECT
+		first = update_mapped_mul(page, true);
+#else
 		first = atomic_inc_and_test(&page->_mapcount);
+#endif
 	}
-
 	if (first) {
 		int nr = compound ? hpage_nr_pages(page) : 1;
 		/*
@@ -1198,8 +1207,13 @@ void page_add_file_rmap(struct page *page, bool compound)
 			if (PageMlocked(page))
 				clear_page_mlock(compound_head(page));
 		}
+#ifdef CONFIG_MAPPED_PROTECT
+		if (!update_mapped_mul(page, true))
+			goto out;
+#else
 		if (!atomic_inc_and_test(&page->_mapcount))
 			goto out;
+#endif
 	}
 	__mod_lruvec_page_state(page, NR_FILE_MAPPED, nr);
 out:
@@ -1233,8 +1247,13 @@ static void page_remove_file_rmap(struct page *page, bool compound)
 		else
 			__dec_node_page_state(page, NR_FILE_PMDMAPPED);
 	} else {
+#ifdef CONFIG_MAPPED_PROTECT
+		if (!update_mapped_mul(page, false))
+			goto out;
+#else
 		if (!atomic_add_negative(-1, &page->_mapcount))
 			goto out;
+#endif
 	}
 
 	/*
@@ -1303,10 +1322,14 @@ void page_remove_rmap(struct page *page, bool compound)
 	if (compound)
 		return page_remove_anon_compound_rmap(page);
 
+#ifdef CONFIG_MAPPED_PROTECT
+	if (!update_mapped_mul(page, false))
+		return;
+#else
 	/* page still mapped by someone else? */
 	if (!atomic_add_negative(-1, &page->_mapcount))
 		return;
-
+#endif
 	/*
 	 * We use the irq-unsafe __{inc|mod}_zone_page_stat because
 	 * these counters are not modified in interrupt context, and
@@ -1890,6 +1913,9 @@ static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
 	pgoff_t pgoff_start, pgoff_end;
 	struct vm_area_struct *vma;
 	unsigned long address;
+#ifdef CONFIG_KSHRINK_LRUVECD
+	bool got_lock = false;
+#endif /* CONFIG_KSHRINK_LRUVECD */
 
 	/*
 	 * The page lock not only makes sure that page->mapping cannot
@@ -1904,8 +1930,17 @@ static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
 
 	pgoff_start = page_to_pgoff(page);
 	pgoff_end = pgoff_start + hpage_nr_pages(page) - 1;
-	if (!locked)
-		i_mmap_lock_read(mapping);
+	if (!locked) {
+#ifdef CONFIG_KSHRINK_LRUVECD
+		if (reclaim_page_trylock(page, &mapping->i_mmap_rwsem, &got_lock)) {
+			if (!got_lock)
+				return;
+		} else
+#endif /* CONFIG_KSHRINK_LRUVECD */
+		{
+			i_mmap_lock_read(mapping);
+		}
+	}
 
 	if (rwc->target_vma) {
 		address = vma_address(page, rwc->target_vma);
