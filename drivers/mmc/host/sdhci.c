@@ -52,6 +52,13 @@ static bool sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
 
 void sdhci_dumpregs(struct sdhci_host *host)
 {
+#ifdef CONFIG_EMMC_SDCARD_OPTIMIZE
+	static int flag = 0;
+	if(!flag)
+		    flag++;
+	else
+		    return;
+#endif
 	mmc_log_string(host->mmc,
 	"BLOCK_SIZE=0x%08x BLOCK_COUNT=0x%08x COMMAND=0x%08x INT_STATUS=0x%08x INT_ENABLE=0x%08x SIGNAL_ENABLE=0x%08x\n",
 	sdhci_readw(host, SDHCI_BLOCK_SIZE),
@@ -1868,6 +1875,12 @@ void sdhci_set_power_noreg(struct sdhci_host *host, unsigned char mode,
 			break;
 		case MMC_VDD_32_33:
 		case MMC_VDD_33_34:
+		/*
+		 * 3.4 ~ 3.6V are valid only for those platforms where it's
+		 * known that the voltage range is supported by hardware.
+		 */
+		case MMC_VDD_34_35:
+		case MMC_VDD_35_36:
 			pwr = SDHCI_POWER_330;
 			break;
 		default:
