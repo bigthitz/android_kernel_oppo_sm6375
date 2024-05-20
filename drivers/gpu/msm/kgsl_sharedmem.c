@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2002,2007-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <asm/cacheflush.h>
@@ -12,6 +13,10 @@
 #include "kgsl_device.h"
 #include "kgsl_pool.h"
 #include "kgsl_sharedmem.h"
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+#include "common.h"
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 
 /*
  * The user can set this from debugfs to force failed memory allocations to
@@ -373,7 +378,14 @@ void kgsl_process_init_sysfs(struct kgsl_device *device,
 				memtypes[i].attr.name);
 	}
 }
-
+#ifdef OPLUS_FEATURE_HEALTHINFO
+#ifdef CONFIG_OPLUS_HEALTHINFO
+unsigned long gpu_total(void)
+{
+	return (unsigned long)atomic_long_read(&kgsl_driver.stats.page_alloc);
+}
+#endif /* CONFIG_OPLUS_HEALTHINFO */
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 static ssize_t memstat_show(struct device *dev,
 			 struct device_attribute *attr, char *buf)
 {
@@ -948,6 +960,9 @@ static void kgsl_contiguous_free(struct kgsl_memdesc *memdesc)
 	if (!memdesc->hostptr)
 		return;
 
+	if (memdesc->priv & KGSL_MEMDESC_MAPPED)
+		return;
+
 	atomic_long_sub(memdesc->size, &kgsl_driver.stats.coherent);
 
 #ifdef CONFIG_MM_STAT_UNRECLAIMABLE_PAGES
@@ -963,8 +978,13 @@ static void kgsl_free_secure_system_pages(struct kgsl_memdesc *memdesc)
 {
 	int i;
 	struct scatterlist *sg;
-	int ret = unlock_sgt(memdesc->sgt);
+	int ret;
 	int order = get_order(PAGE_SIZE);
+
+	if (memdesc->priv & KGSL_MEMDESC_MAPPED)
+		return;
+
+	ret = unlock_sgt(memdesc->sgt);
 
 	if (ret) {
 		/*
@@ -998,7 +1018,12 @@ static void kgsl_free_secure_system_pages(struct kgsl_memdesc *memdesc)
 
 static void kgsl_free_secure_pool_pages(struct kgsl_memdesc *memdesc)
 {
-	int ret = unlock_sgt(memdesc->sgt);
+	int ret;
+
+	if (memdesc->priv & KGSL_MEMDESC_MAPPED)
+		return;
+
+	ret = unlock_sgt(memdesc->sgt);
 
 	if (ret) {
 		/*
@@ -1028,6 +1053,9 @@ static void kgsl_free_pool_pages(struct kgsl_memdesc *memdesc)
 	kgsl_paged_unmap_kernel(memdesc);
 	WARN_ON(memdesc->hostptr);
 
+	if (memdesc->priv & KGSL_MEMDESC_MAPPED)
+		return;
+
 	atomic_long_sub(memdesc->size, &kgsl_driver.stats.page_alloc);
 
 	kgsl_pool_free_pages(memdesc->pages, memdesc->page_count);
@@ -1044,6 +1072,9 @@ static void kgsl_free_system_pages(struct kgsl_memdesc *memdesc)
 
 	kgsl_paged_unmap_kernel(memdesc);
 	WARN_ON(memdesc->hostptr);
+
+	if (memdesc->priv & KGSL_MEMDESC_MAPPED)
+		return;
 
 	atomic_long_sub(memdesc->size, &kgsl_driver.stats.page_alloc);
 
@@ -1476,3 +1507,49 @@ bool kgsl_sharedmem_get_noretry(void)
 {
 	return sharedmem_noretry_flag;
 }
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+
+void dump_kgsl_process_mem_detail(struct kgsl_process_private *priv)
+{
+	int i = 0;
+	int id = 0;
+	struct kgsl_mem_entry *entry = NULL;
+	uint64_t memtype_detail[KGSL_MEMTYPE_KERNEL + 1] = {0};
+
+	spin_lock(&priv->mem_lock);
+	for (entry = idr_get_next(&priv->mem_idr, &id); entry;
+		id++, entry = idr_get_next(&priv->mem_idr, &id)) {
+		struct kgsl_memdesc *memdesc;
+		unsigned int type;
+
+		if (!kgsl_mem_entry_get(entry))
+			continue;
+
+		/*
+		 * we must unlock the mem_lock
+		 * This is to avoid a deadlock where we put back last reference of the
+		 * process mem entry (via kgsl_mem_entry_put_deferred)
+		 */
+		spin_unlock(&priv->mem_lock);
+
+		memdesc = &entry->memdesc;
+		type = kgsl_memdesc_get_memtype(memdesc);
+
+		if (type <= KGSL_MEMTYPE_KERNEL)
+			memtype_detail[type] += memdesc->size;
+
+		kgsl_mem_entry_put_deferred(entry);
+		spin_lock(&priv->mem_lock);
+	}
+	spin_unlock(&priv->mem_lock);
+
+	osvelte_info("%-16s %-5s \n", "memtype", "size");
+
+	for (i = 0; i <= KGSL_MEMTYPE_KERNEL; i++) {
+		if (memtype_detail[i] > 0)
+			osvelte_info("%-16d %-5d\n", i, memtype_detail[i] / SZ_1K);
+	}
+}
+
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
