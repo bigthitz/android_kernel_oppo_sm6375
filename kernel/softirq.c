@@ -35,6 +35,10 @@
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(irq_handler_entry);
 EXPORT_TRACEPOINT_SYMBOL_GPL(irq_handler_exit);
+EXPORT_TRACEPOINT_SYMBOL_GPL(softirq_entry);
+EXPORT_TRACEPOINT_SYMBOL_GPL(softirq_exit);
+EXPORT_TRACEPOINT_SYMBOL_GPL(tasklet_entry);
+EXPORT_TRACEPOINT_SYMBOL_GPL(tasklet_exit);
 
 /*
    - No shared variables, all the data are CPU local.
@@ -59,6 +63,11 @@ DEFINE_PER_CPU_ALIGNED(irq_cpustat_t, irq_stat);
 EXPORT_PER_CPU_SYMBOL(irq_stat);
 #endif
 
+#ifdef CONFIG_BLOCKIO_UX_OPT
+extern __u32 get_block_ux_softirqs(void);
+extern void clear_block_ux_softirqs(void);
+unsigned long counter, total_us, max_us, min_us, aver_us, restart_time;
+#endif
 static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;
 
 DEFINE_PER_CPU(struct task_struct *, ksoftirqd);
@@ -163,6 +172,18 @@ static DEFINE_PER_CPU(struct softirq_ctrl, softirq_ctrl) = {
 	.lock	= INIT_LOCAL_LOCK(softirq_ctrl.lock),
 };
 
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+static struct lock_class_key bh_lock_key;
+struct lockdep_map bh_lock_map = {
+	.name			= "local_bh",
+	.key			= &bh_lock_key,
+	.wait_type_outer	= LD_WAIT_FREE,
+	.wait_type_inner	= LD_WAIT_CONFIG, /* PREEMPT_RT makes BH preemptible. */
+	.lock_type		= LD_LOCK_PERCPU,
+};
+EXPORT_SYMBOL_GPL(bh_lock_map);
+#endif
+
 /**
  * local_bh_blocked() - Check for idle whether BH processing is blocked
  *
@@ -184,6 +205,8 @@ void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
 	int newcnt;
 
 	WARN_ON_ONCE(in_hardirq());
+
+	lock_map_acquire_read(&bh_lock_map);
 
 	/* First entry of a task into a BH disabled section? */
 	if (!current->softirq_disable_cnt) {
@@ -248,6 +271,8 @@ void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
 	WARN_ON_ONCE(in_hardirq());
 	lockdep_assert_irqs_enabled();
 
+	lock_map_release(&bh_lock_map);
+
 	local_irq_save(flags);
 	curcnt = __this_cpu_read(softirq_ctrl.cnt);
 
@@ -298,6 +323,8 @@ static inline void ksoftirqd_run_begin(void)
 /* Counterpart to ksoftirqd_run_begin() */
 static inline void ksoftirqd_run_end(void)
 {
+	/* pairs with the lock_map_acquire_read() in ksoftirqd_run_begin() */
+	lock_map_release(&bh_lock_map);
 	__local_bh_enable(SOFTIRQ_OFFSET, true);
 	WARN_ON_ONCE(in_interrupt());
 	local_irq_enable();
@@ -317,17 +344,24 @@ static inline void invoke_softirq(void)
 		wakeup_softirqd();
 }
 
+#define SCHED_SOFTIRQ_MASK	BIT(SCHED_SOFTIRQ)
+
 /*
  * flush_smp_call_function_queue() can raise a soft interrupt in a function
- * call. On RT kernels this is undesired and the only known functionality
- * in the block layer which does this is disabled on RT. If soft interrupts
- * get raised which haven't been raised before the flush, warn so it can be
+ * call. On RT kernels this is undesired and the only known functionalities
+ * are in the block layer which is disabled on RT, and in the scheduler for
+ * idle load balancing. If soft interrupts get raised which haven't been
+ * raised before the flush, warn if it is not a SCHED_SOFTIRQ so it can be
  * investigated.
  */
 void do_softirq_post_smp_call_flush(unsigned int was_pending)
 {
-	if (WARN_ON_ONCE(was_pending != local_softirq_pending()))
+	unsigned int is_pending = local_softirq_pending();
+
+	if (unlikely(was_pending != is_pending)) {
+		WARN_ON_ONCE(was_pending != (is_pending & ~SCHED_SOFTIRQ_MASK));
 		invoke_softirq();
+	}
 }
 
 #else /* CONFIG_PREEMPT_RT */
@@ -563,7 +597,7 @@ static __u32 softirq_deferred_for_rt(__u32 *pending)
 #define softirq_deferred_for_rt(x) (0)
 #endif
 
-asmlinkage __visible void __softirq_entry __do_softirq(void)
+static void handle_softirqs(bool ksirqd)
 {
 	unsigned long end = jiffies + MAX_SOFTIRQ_TIME;
 	unsigned long old_flags = current->flags;
@@ -591,6 +625,9 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
 
 restart:
 	/* Reset the pending bitmask before enabling irqs */
+#ifdef CONFIG_BLOCKIO_UX_OPT
+	clear_block_ux_softirqs();
+#endif
 	set_softirq_pending(deferred);
 	set_active_softirqs(pending);
 
@@ -623,8 +660,7 @@ restart:
 	}
 
 	set_active_softirqs(0);
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT) &&
-	    __this_cpu_read(ksoftirqd) == current)
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT) && ksirqd)
 		rcu_softirq_qs();
 
 	local_irq_disable();
@@ -638,6 +674,53 @@ restart:
 			goto restart;
 	}
 
+#ifdef CONFIG_BLOCKIO_UX_OPT
+	if (get_block_ux_softirqs() && local_softirq_pending()) {
+		local_irq_enable();
+		if (local_softirq_pending() & (1 << BLOCK_SOFTIRQ)) {
+			unsigned int vec_nr;
+			ktime_t start, end, delta;
+			ktime_t start_tmp, end_tmp;
+			start =  ktime_get();
+restart_act_block:
+			clear_block_ux_softirqs();
+			set_softirq_pending(local_softirq_pending() & (~(1 << BLOCK_SOFTIRQ)));
+
+			h = softirq_vec + BLOCK_SOFTIRQ;
+			vec_nr = h - softirq_vec;
+
+			trace_softirq_entry(vec_nr);
+			start_tmp =  ktime_get();
+			h->action(h);
+			end_tmp = ktime_get();
+			delta = ktime_us_delta(end_tmp, start_tmp);
+			trace_softirq_exit(vec_nr);
+
+			counter++;
+			total_us += delta;
+
+			if (max_us < delta)
+				max_us = delta;
+			if (min_us > delta)
+				min_us = delta;
+
+			aver_us = total_us / counter;
+
+
+			if (local_softirq_pending() & (1 << BLOCK_SOFTIRQ)
+					&& get_block_ux_softirqs()) {
+				end = ktime_get();
+				if (ktime_us_delta(end, start) < 1000) {
+					goto restart_act_block;
+				}
+			}
+		}
+		local_irq_disable();
+
+		pending = local_softirq_pending();
+		deferred = softirq_deferred_for_rt(&pending);
+	}
+#endif
 	if (pending | deferred)
 		wakeup_softirqd();
 
@@ -645,6 +728,11 @@ restart:
 	lockdep_softirq_end(in_hardirq);
 	softirq_handle_end();
 	current_restore_flags(old_flags, PF_MEMALLOC);
+}
+
+asmlinkage __visible void __softirq_entry __do_softirq(void)
+{
+	handle_softirqs(false);
 }
 
 /**
@@ -751,6 +839,7 @@ void raise_softirq(unsigned int nr)
 	raise_softirq_irqoff(nr);
 	local_irq_restore(flags);
 }
+EXPORT_SYMBOL_GPL(raise_softirq);
 
 void __raise_softirq_irqoff(unsigned int nr)
 {
@@ -982,7 +1071,7 @@ static void run_ksoftirqd(unsigned int cpu)
 		 * We can safely run softirq on inline stack, as we are not deep
 		 * in the task stack here.
 		 */
-		__do_softirq();
+		handle_softirqs(true);
 		ksoftirqd_run_end();
 		cond_resched();
 		return;

@@ -4,6 +4,8 @@
  * Author: Quentin Perret <qperret@google.com>
  */
 
+#include <linux/init.h>
+#include <linux/initrd.h>
 #include <linux/io.h>
 #include <linux/kmemleak.h>
 #include <linux/kvm_host.h>
@@ -14,12 +16,16 @@
 #include <linux/of_fdt.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/sort.h>
+#include <linux/stat.h>
 
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_pkvm.h>
 #include <asm/kvm_pkvm_module.h>
 #include <asm/setup.h>
+
+#include <uapi/linux/mount.h>
+#include <linux/init_syscalls.h>
 
 #include "hyp_constants.h"
 
@@ -56,12 +62,34 @@ static void __init sort_memblock_regions(void)
 static int __init register_memblock_regions(void)
 {
 	struct memblock_region *reg;
+	bool pvmfw_in_mem = false;
 
 	for_each_mem_region(reg) {
 		if (*hyp_memblock_nr_ptr >= HYP_MEMBLOCK_REGIONS)
 			return -ENOMEM;
 
 		hyp_memory[*hyp_memblock_nr_ptr] = *reg;
+		(*hyp_memblock_nr_ptr)++;
+
+		if (!*pvmfw_size || pvmfw_in_mem ||
+			!memblock_addrs_overlap(reg->base, reg->size, *pvmfw_base, *pvmfw_size))
+			continue;
+		/* If the pvmfw region overlaps a memblock, it must be a subset */
+		if (*pvmfw_base < reg->base ||
+				(*pvmfw_base + *pvmfw_size) > (reg->base + reg->size))
+			return -EINVAL;
+		pvmfw_in_mem = true;
+	}
+
+	if (*pvmfw_size && !pvmfw_in_mem) {
+		if (*hyp_memblock_nr_ptr >= HYP_MEMBLOCK_REGIONS)
+			return -ENOMEM;
+
+		hyp_memory[*hyp_memblock_nr_ptr] = (struct memblock_region) {
+			.base   = *pvmfw_base,
+			.size   = *pvmfw_size,
+			.flags  = MEMBLOCK_NOMAP,
+		};
 		(*hyp_memblock_nr_ptr)++;
 	}
 	sort_memblock_regions();
@@ -256,6 +284,8 @@ static int __pkvm_create_hyp_vm(struct kvm *host_kvm)
 	host_kvm->arch.pkvm.handle = handle;
 
 	total_sz = hyp_vm_sz + last_ran_sz + pgd_sz;
+	atomic64_set(&host_kvm->stat.protected_hyp_mem, total_sz);
+	kvm_account_pgtable_pages(pgd, pgd_sz >> PAGE_SHIFT);
 
 	/* Donate memory for the vcpus at hyp and initialize it. */
 	hyp_vcpu_sz = PAGE_ALIGN(PKVM_HYP_VCPU_SIZE);
@@ -274,18 +304,15 @@ static int __pkvm_create_hyp_vm(struct kvm *host_kvm)
 			goto destroy_vm;
 		}
 
-		total_sz += hyp_vcpu_sz;
-
 		ret = kvm_call_hyp_nvhe(__pkvm_init_vcpu, handle, host_vcpu,
 					hyp_vcpu);
 		if (ret) {
 			free_pages_exact(hyp_vcpu, hyp_vcpu_sz);
 			goto destroy_vm;
 		}
-	}
 
-	atomic64_set(&host_kvm->stat.protected_hyp_mem, total_sz);
-	kvm_account_pgtable_pages(pgd, pgd_sz >> PAGE_SHIFT);
+		atomic64_add(hyp_vcpu_sz, &host_kvm->stat.protected_hyp_mem);
+	}
 
 	return 0;
 
@@ -623,6 +650,7 @@ static int __init __pkvm_request_early_module(char *module_name,
 		"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
 		NULL
 	};
+	static bool proc;
 	char **argv;
 	int idx = 0;
 
@@ -653,6 +681,15 @@ static int __init __pkvm_request_early_module(char *module_name,
 
 	/* Even with CONFIG_STATIC_USERMODEHELPER we really want this path */
 	info->path = modprobe_path;
+
+	if (!proc) {
+		wait_for_initramfs();
+		if (init_mount("proc", "/proc", "proc",
+			       MS_SILENT | MS_NOEXEC | MS_NOSUID, NULL))
+			pr_warn("Couldn't mount /proc, pKVM module parameters will be ignored\n");
+
+		proc = true;
+	}
 
 	return call_usermodehelper_exec(info, UMH_WAIT_PROC | UMH_KILLABLE);
 err:
