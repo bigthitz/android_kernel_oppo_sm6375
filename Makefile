@@ -494,7 +494,7 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wno-strict-prototypes -Wno-trigraphs \
 		   -Werror=implicit-function-declaration -Werror=implicit-int \
 		   -Werror=return-type -Wno-format-security \
 		   -Wno-error=unused-but-set-variable \
-		   -std=gnu89 -Wno-error
+		   -std=gnu89 -Wno-error -Wno-ignored-optimization-argument
 KBUILD_CPPFLAGS := -D__KERNEL__
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
